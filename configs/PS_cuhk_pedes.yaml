@@ -1,9 +1,9 @@
-train_file:  ['../dataset/CUHK-PEDES/processed_data/train.json']
-val_file: '../dataset/CUHK-PEDES/processed_data/val.json'
-test_file: '../dataset/CUHK-PEDES/processed_data/test.json'
-train_image_root: '../dataset/CUHK-PEDES/imgs'
-val_image_root: '../dataset/CUHK-PEDES/imgs'
-test_image_root: '../dataset/CUHK-PEDES/imgs'
+train_file:  ['./re_id/CUHK-PEDES/processed_data/train.json']
+val_file: './re_id/CUHK-PEDES/processed_data/val.json'
+test_file: './re_id/CUHK-PEDES/processed_data/test.json'
+train_image_root: './re_id/CUHK-PEDES/imgs'
+val_image_root: './re_id/CUHK-PEDES/imgs'
+test_image_root: './re_id/CUHK-PEDES/imgs'
 
 bert_config: 'configs/config_bert.json'
 

@@ -5,7 +5,7 @@ import os
 import random
 import time
 import numpy as np
-import ruamel_yaml as yaml
+import ruamel.yaml as yaml
 import torch
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
@@ -14,11 +14,17 @@ from pathlib import Path
 
 import utils
 from dataset import create_dataset, create_sampler, create_loader
-from models.model_person_search import ALBEF
-from models.tokenization_bert import BertTokenizer
-from models.vit import interpolate_pos_embed
+from my_models.model_person_search import ALBEF
+from my_models.tokenization_bert import BertTokenizer
+from my_models.vit import interpolate_pos_embed
 from optim import create_optimizer
 from scheduler import create_scheduler
+
+
+os.environ['http_proxy'] = "http://127.0.0.1:7890"
+os.environ['https_proxy'] = "http://127.0.0.1:7890"
+# 设置 transformers 缓存目录
+os.environ['TRANSFORMERS_CACHE'] = '/home/cxd/.cache/huggingface/transformers'
 
 def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, scheduler, config):
     # train
@@ -205,7 +211,13 @@ def main(args, config):
                                                           num_workers=[4, 4, 4],
                                                           is_trains=[True, False, False],
                                                           collate_fns=[None, None, None])
-    tokenizer = BertTokenizer.from_pretrained(args.text_encoder)
+    print("args.text_encoder",args.text_encoder)
+    tokenizer = BertTokenizer.from_pretrained(args.text_encoder, 
+                                        proxies={'http': 'http://127.0.0.1:7890',
+                                                'https': 'http://127.0.0.1:7890'},trust_remote_code=True, 
+                                                # force_download=True,
+                                                local_files_only=True,
+                                                )#
 
     start_epoch = 0
     max_epoch = config['schedular']['epochs']
