@@ -24,7 +24,7 @@ from scheduler import create_scheduler
 os.environ['http_proxy'] = "http://127.0.0.1:7890"
 os.environ['https_proxy'] = "http://127.0.0.1:7890"
 # 设置 transformers 缓存目录
-os.environ['TRANSFORMERS_CACHE'] = '/home/cxd/.cache/huggingface/transformers'
+# os.environ['TRANSFORMERS_CACHE'] = '/home/root/.cache/huggingface/transformers'
 
 def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, scheduler, config):
     # train
@@ -213,8 +213,9 @@ def main(args, config):
                                                           collate_fns=[None, None, None])
     print("args.text_encoder",args.text_encoder)
     tokenizer = BertTokenizer.from_pretrained(args.text_encoder, 
-                                        proxies={'http': 'http://127.0.0.1:7890',
-                                                'https': 'http://127.0.0.1:7890'},trust_remote_code=True, 
+                                        # proxies={'http': 'http://127.0.0.1:7890',
+                                        #         'https': 'http://127.0.0.1:7890'},
+                                        trust_remote_code=True, 
                                                 # force_download=True,
                                                 local_files_only=True,
                                                 )#

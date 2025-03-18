@@ -7,7 +7,7 @@
             "request": "launch",
             "module": "torch.distributed.run",
             "args": [
-                "--nproc_per_node=2",
+                "--nproc_per_node=1",
                 "--rdzv_endpoint=127.0.0.1:29501",
                 "Retrieval.py",
                 "--config",
@@ -19,7 +19,7 @@
                 "--eval_mAP"
             ],
             "env": {
-                "CUDA_VISIBLE_DEVICES": "0,2"
+                "CUDA_VISIBLE_DEVICES": "0"
             },
             "console": "integratedTerminal",
             "justMyCode": false
