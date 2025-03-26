@@ -26,7 +26,83 @@ os.environ['https_proxy'] = "http://127.0.0.1:7890"
 # 设置 transformers 缓存目录
 # os.environ['TRANSFORMERS_CACHE'] = '/home/root/.cache/huggingface/transformers'
 
-def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, scheduler, config):
+# cluster images before each epoch begins
+from sklearn.cluster import DBSCAN
+from my_utils.faiss_rerank import compute_jaccard_distance
+def cluster_begin_epoch(train_loader, model, args,epoch = 0,tokenizer = None):
+    device = "cuda"
+    feature_size =256 #cuhk是577
+    max_size = args.batch_size* ( len(train_loader)  )  #这个是所有的图片和描述对的数量共计6800对左右     
+    image_bank = torch.zeros((max_size, feature_size)).to(device)
+    index = 0
+
+    model.to(device)
+    model = model.eval()
+    #TODO这玩意我以后一定改
+    with torch.no_grad():
+        if args.distributed:
+            model=model.module
+        metric_logger = utils.MetricLogger(delimiter="  ")
+        header = 'Train Epoch的聚类: [{}]'.format(epoch)
+        for i, (image1, image2, text1, text2, idx, replace) in enumerate(metric_logger.log_every(train_loader, 60000, header)):
+            image1 = image1.to(device, non_blocking=True)
+            image2 = image2.to(device, non_blocking=True)
+            idx = idx.to(device, non_blocking=True)
+            replace = replace.to(device, non_blocking=True)
+            text_input1 = tokenizer(text1, padding='longest', max_length=config['max_words'], return_tensors="pt").to(device)
+            text_input2 = tokenizer(text2, padding='longest', max_length=config['max_words'], return_tensors="pt").to(device)
+            
+            image_embeds = model.visual_encoder(image1)#(13,577,768)
+            image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image1.device)#注意力掩码全一表示所有图像token都应该被关注
+            image_feat = F.normalize(model.vision_proj(image_embeds[:, 0, :]), dim=-1)#用于取cls token的特征,shape(13,577)
+            # extract text features
+            text_output = model.text_encoder.bert(text_input2.input_ids, attention_mask=text_input2.attention_mask,
+                                                return_dict=True, mode='text')
+            text_embeds = text_output.last_hidden_state
+            text_feat = F.normalize(model.text_proj(text_embeds[:, 0, :]), dim=-1)#同样是取cls token的特征
+            batch_size = image1.shape[0]
+            image_bank[index: index + batch_size] = image_feat
+            index = index + batch_size
+            
+
+        image_bank = image_bank[:index]       
+        image_rerank_dist = compute_jaccard_distance(image_bank, k1=30, k2=6, search_option=0)  
+
+        # DBSCAN cluster
+        cluster = DBSCAN(eps= 0.6, min_samples=4, metric='precomputed', n_jobs=-1)
+
+        image_pseudo_labels = cluster.fit_predict(image_rerank_dist)    
+
+        del image_rerank_dist
+    del image_bank
+
+    # with torch.no_grad():
+    #     for n_iter, batch in enumerate(train_loader):       
+    #         batch = {k: v.to(device) for k, v in batch.items()}
+    #         batch_size = batch['images'].shape[0]   
+    #         i_feats = model(batch, flag=False)
+
+    #         image_bank[index: index + batch_size] = i_feats
+
+    #         index = index + batch_size
+
+    #     image_bank = image_bank[:index]       
+    #     image_rerank_dist = compute_jaccard_distance(image_bank, k1=30, k2=6, search_option=0)  
+
+    #     # DBSCAN cluster
+    #     cluster = DBSCAN(eps= 0.6, min_samples=4, metric='precomputed', n_jobs=-1)
+
+    #     image_pseudo_labels = cluster.fit_predict(image_rerank_dist)    
+
+    #     del image_rerank_dist
+    # del image_bank
+
+    return image_pseudo_labels
+
+
+
+
+def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, scheduler, config,image_pseudo_labels):
     # train
     model.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -42,9 +118,15 @@ def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device,
     warmup_iterations = warmup_steps * step_size
     for i, (image1, image2, text1, text2, idx, replace) in enumerate(
             metric_logger.log_every(data_loader, print_freq, header)):
+        batch_size = image1.shape[0]
+        #单次的伪标签
+        batch_pseudo_id = image_pseudo_labels[i*batch_size : i*batch_size + batch_size]
+        
         image1 = image1.to(device, non_blocking=True)
         image2 = image2.to(device, non_blocking=True)
-        idx = idx.to(device, non_blocking=True)
+        # idx = idx.to(device, non_blocking=True)
+        idx= torch.tensor(batch_pseudo_id).to(device, non_blocking=True)
+        
         replace = replace.to(device, non_blocking=True)
         text_input1 = tokenizer(text1, padding='longest', max_length=config['max_words'], return_tensors="pt").to(device)
         text_input2 = tokenizer(text2, padding='longest', max_length=config['max_words'], return_tensors="pt").to(device)
@@ -205,6 +287,7 @@ def main(args, config):
         samplers = create_sampler([train_dataset], [True], num_tasks, global_rank) + [None, None]
     else:
         samplers = [None, None, None]
+    #dataloader在这,然后logevery是直接迭代这个
     train_loader, val_loader, test_loader = create_loader([train_dataset, val_dataset, test_dataset], samplers,
                                                           batch_size=[config['batch_size_train']] + [
                                                               config['batch_size_test']] * 2,
@@ -265,13 +348,20 @@ def main(args, config):
     print("Start training")
     start_time = time.time()
     for epoch in range(start_epoch, max_epoch):
+        
         if not args.evaluate:
+             #TODO,这里使用聚类生成伪标签
+            image_pseudo_labels = cluster_begin_epoch(train_loader, model, args,epoch,tokenizer)
+            image_num_cluster = len(set(image_pseudo_labels)) - (1 if -1 in image_pseudo_labels else 0)
+            print("==> Statistics for epoch [{}]: {} image clusters".format(epoch, image_num_cluster))
             if epoch > 0:
                 lr_scheduler.step(epoch + warmup_steps)
             if args.distributed:
                 train_loader.sampler.set_epoch(epoch)
             train_stats = train(model, train_loader, optimizer, tokenizer, epoch, warmup_steps, device, lr_scheduler,
-                                config)
+                                config,image_pseudo_labels)
+        
+        
         if epoch >= config['eval_epoch'] or args.evaluate:
             score_test_t2i = evaluation(model_without_ddp, test_loader, tokenizer, device, config)
             if utils.is_main_process():
@@ -331,6 +421,8 @@ if __name__ == '__main__':
     parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
     parser.add_argument('--distributed', default=True, type=bool)
+    parser.add_argument('--batch_size', default=13, type=int)
+    parser.add_argument('--embed_dim', default=577, type=int)
     args = parser.parse_args()
     config = yaml.load(open(args.config, 'r'), Loader=yaml.Loader)
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)

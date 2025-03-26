@@ -9,7 +9,7 @@ bert_config: 'configs/config_bert.json'
 
 max_words: 50
 image_res: 384
-batch_size_train: 13
+batch_size_train: 32
 batch_size_test: 64
 
 mlm_probability: 0.15

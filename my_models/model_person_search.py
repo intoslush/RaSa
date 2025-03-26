@@ -53,21 +53,21 @@ class ALBEF(nn.Module):
         self.image_queue = nn.functional.normalize(self.image_queue, dim=0)
         self.text_queue = nn.functional.normalize(self.text_queue, dim=0)
 
-    def forward(self, image1, image2, text1, text2, alpha, idx, replace):
+    def forward(self, image1, image2, text1, text2, alpha, idx, replace):#其中text2是概率同一个id的其他图片的描述,img1和img2是同一个图片的两个不同的增广
         # extract image features
-        image_embeds = self.visual_encoder(image1)
-        image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image1.device)
-        image_feat = F.normalize(self.vision_proj(image_embeds[:, 0, :]), dim=-1)
+        image_embeds = self.visual_encoder(image1)#(13,577,768)
+        image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image1.device)#注意力掩码全一表示所有图像token都应该被关注
+        image_feat = F.normalize(self.vision_proj(image_embeds[:, 0, :]), dim=-1)#用于取cls token的特征,shape(13,577)
         # extract text features
         text_output = self.text_encoder.bert(text2.input_ids, attention_mask=text2.attention_mask,
                                              return_dict=True, mode='text')
         text_embeds = text_output.last_hidden_state
-        text_feat = F.normalize(self.text_proj(text_embeds[:, 0, :]), dim=-1)
+        text_feat = F.normalize(self.text_proj(text_embeds[:, 0, :]), dim=-1)#同样是取cls token的特征
         # Contrastive loss
         idx = idx.view(-1, 1)
-        idx_all = torch.cat([idx.t(), self.idx_queue.clone().detach()], dim=1)
-        pos_idx = torch.eq(idx, idx_all).float()
-        sim_targets = pos_idx / pos_idx.sum(1, keepdim=True)
+        idx_all = torch.cat([idx.t(), self.idx_queue.clone().detach()], dim=1)#(13,65549)
+        pos_idx = torch.eq(idx, idx_all).float()#(13,65549)
+        sim_targets = pos_idx / pos_idx.sum(1, keepdim=True)#归一化,做出样本标签队列,(13,65549)
         with torch.no_grad():
             self._momentum_update()
             image_embeds_m = self.visual_encoder_m(image2)
@@ -79,12 +79,12 @@ class ALBEF(nn.Module):
             text_feat_m = F.normalize(self.text_proj_m(text_output_m.last_hidden_state[:, 0, :]), dim=-1)
             text_feat_all = torch.cat([text_feat_m.t(), self.text_queue.clone().detach()], dim=1)
 
-            sim_i2t_m = image_feat_m @ text_feat_all / self.temp
+            sim_i2t_m = image_feat_m @ text_feat_all / self.temp#计算当前批次与队列的相似得分
             sim_t2i_m = text_feat_m @ image_feat_all / self.temp
             sim_i2i_m = image_feat_m @ image_feat_all / self.temp
             sim_t2t_m = text_feat_m @ text_feat_all / self.temp
 
-            sim_i2t_targets = alpha * F.softmax(sim_i2t_m, dim=1) + (1 - alpha) * sim_targets
+            sim_i2t_targets = alpha * F.softmax(sim_i2t_m, dim=1) + (1 - alpha) * sim_targets#用来让标签匹配变软
             sim_t2i_targets = alpha * F.softmax(sim_t2i_m, dim=1) + (1 - alpha) * sim_targets
             sim_i2i_targets = alpha * F.softmax(sim_i2i_m, dim=1) + (1 - alpha) * sim_targets
             sim_t2t_targets = alpha * F.softmax(sim_t2t_m, dim=1) + (1 - alpha) * sim_targets
@@ -105,6 +105,7 @@ class ALBEF(nn.Module):
         # Relation-aware Learning: Probabilistic Image-Text Matching + Positive Relation Detection
         # Probabilistic Image-Text Matching
         # forward the positve image-text pairs
+        #两个模态融合的部分
         output_pos = self.text_encoder.bert(encoder_embeds=text_embeds,
                                             attention_mask=text2.attention_mask,
                                             encoder_hidden_states=image_embeds,
@@ -117,11 +118,11 @@ class ALBEF(nn.Module):
             weights_i2t = F.softmax(sim_i2t[:, :bs], dim=1)
             weights_t2i = F.softmax(sim_t2i[:, :bs], dim=1)
             mask = torch.eq(idx, idx.T)
-            weights_i2t.masked_fill_(mask, 0)
+            weights_i2t.masked_fill_(mask, 0)#通过掩码保证不会选正样本作为难样本
             weights_t2i.masked_fill_(mask, 0)
         # select a negative image for each text
         image_neg_idx = torch.multinomial(weights_t2i, 1).flatten()
-        image_embeds_neg = image_embeds[image_neg_idx]
+        image_embeds_neg = image_embeds[image_neg_idx]#难的负样本
         # select a negative text for each image
         text_neg_idx = torch.multinomial(weights_i2t, 1).flatten()
         text_embeds_neg = text_embeds[text_neg_idx]
@@ -143,7 +144,10 @@ class ALBEF(nn.Module):
         vl_output = self.itm_head(vl_embeddings)
         itm_labels = torch.cat([torch.ones(bs, dtype=torch.long), torch.zeros(2 * bs, dtype=torch.long)],
                                dim=0).to(image1.device)
+        #与融合后的标签直接做交叉熵
         loss_pitm = F.cross_entropy(vl_output, itm_labels)
+        
+        
         # Positive Relation Detection
         prd_output = self.prd_head(output_pos.last_hidden_state[:, 0, :])
         loss_prd = F.cross_entropy(prd_output, replace)
@@ -153,7 +157,7 @@ class ALBEF(nn.Module):
         labels = input_ids.clone()
         mrtd_input_ids = input_ids.clone()
         # Masked Language Modeling
-        probability_matrix = torch.full(labels.shape, self.mlm_probability)
+        probability_matrix = torch.full(labels.shape, self.mlm_probability)#每个都有相同的概率被掩码
         input_ids, labels = self.mask(input_ids, self.text_encoder.config.vocab_size, targets=labels, probability_matrix=probability_matrix)
         with torch.no_grad():
             logits_m = self.text_encoder_m(input_ids,
@@ -162,8 +166,9 @@ class ALBEF(nn.Module):
                                            encoder_attention_mask=image_atts,
                                            return_dict=True,
                                            return_logits=True,
-                                           )
-            prediction = F.softmax(logits_m, dim=-1)
+                                           )#(13,577,30522)
+            prediction = F.softmax(logits_m, dim=-1)#(13,577,30522)
+        #输入的是mask后的文本
         mlm_output = self.text_encoder(input_ids,
                                        attention_mask=text1.attention_mask,
                                        encoder_hidden_states=image_embeds,
@@ -221,7 +226,7 @@ class ALBEF(nn.Module):
         batch_size = image_feats.shape[0]
         ptr = int(self.queue_ptr)
         # replace the keys at ptr (dequeue and enqueue)
-        empty = self.image_queue.size(1) - ptr
+        empty = self.image_queue.size(1) - ptr#队列长和指针
         if batch_size <= empty:
             self.image_queue[:, ptr:ptr + batch_size] = image_feats.T
             self.text_queue[:, ptr:ptr + batch_size] = text_feats.T
@@ -237,10 +242,10 @@ class ALBEF(nn.Module):
         self.queue_ptr[0] = ptr
 
     def mask(self, input_ids, vocab_size, targets=None, masked_indices=None, probability_matrix=None):
-        if masked_indices is None:
-            masked_indices = torch.bernoulli(probability_matrix).bool()
+        if masked_indices is None:#用来确定掩码位置
+            masked_indices = torch.bernoulli(probability_matrix).bool()#bernoulli函数生成0-1随机数
         masked_indices[input_ids == self.tokenizer.pad_token_id] = False
-        masked_indices[input_ids == self.tokenizer.cls_token_id] = False
+        masked_indices[input_ids == self.tokenizer.cls_token_id] = False#padding和cls不应该被掩码
         if targets is not None:
             targets[~masked_indices] = -100  # We only compute loss on masked tokens
         # 80% of the time, we replace masked input tokens with tokenizer.mask_token ([MASK])
@@ -256,13 +261,13 @@ class ALBEF(nn.Module):
         else:
             return input_ids
 
-    def mrtd_mask_modeling(self, mrtd_input_ids, ori_input_ids, attention_mask, weights):
+    def mrtd_mask_modeling(self, mrtd_input_ids, ori_input_ids, attention_mask, weights):#weights(13, 36, 30522)
         bs = mrtd_input_ids.size(0)
-        weights = weights.view(-1, weights.size(-1))
-        pred = torch.multinomial(weights, 1).view(bs, -1)
+        weights = weights.view(-1, weights.size(-1))#(468, 30522)
+        pred = torch.multinomial(weights, 1).view(bs, -1)#每行采样一个词,(13, 36)
         pred[:, 0] = self.tokenizer.cls_token_id
         # pad_token_id is 0
-        mrtd_input_ids = pred * attention_mask
+        mrtd_input_ids = pred * attention_mask#(13, 36)
         mrtd_labels = (pred != ori_input_ids) * attention_mask
         mrtd_labels[mrtd_input_ids == self.tokenizer.pad_token_id] = -100
         mrtd_labels[mrtd_input_ids == self.tokenizer.cls_token_id] = -100

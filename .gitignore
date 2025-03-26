@@ -141,4 +141,8 @@ cython_debug/
 # IDEA
 .idea/
 data/
-<re_id>
+# 忽略 re_id 及其所有内容
+re_id
+re_id/
+/re_id
+/re_id/**
