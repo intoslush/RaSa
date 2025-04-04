@@ -9,7 +9,7 @@ bert_config: 'configs/config_bert.json'
 
 max_words: 50
 image_res: 384
-batch_size_train: 13
+batch_size_train: 16
 batch_size_test: 64
 
 mlm_probability: 0.15
@@ -26,9 +26,9 @@ alpha: 0.4
 warm_up: True
 
 optimizer: {opt: adamW, lr: 1e-5, weight_decay: 0.02, lr_custm: 1e-4}
-schedular: {sched: cosine, lr: 1e-5, epochs: 30, min_lr: 1e-6, decay_rate: 1, warmup_lr: 1e-5, warmup_epochs: 1, cooldown_epochs: 0}
+schedular: {sched: cosine, lr: 1e-5, epochs: 10, min_lr: 1e-6, decay_rate: 1, warmup_lr: 1e-5, warmup_epochs: 1, cooldown_epochs: 0}
 
-eval_epoch: 29
+eval_epoch: 1
 
 weights:
   - 0.5

@@ -123,6 +123,7 @@ def evaluation(model, data_loader, tokenizer, device, config):
     end = min(sims_matrix.size(0), start + step)
     for i, sims in enumerate(metric_logger.log_every(sims_matrix[start:end], 50, header)):
         topk_sim, topk_idx = sims.topk(k=config['k_test'], dim=0)
+        topk_idx = topk_idx.to(image_feats.device)
         encoder_output = image_feats[topk_idx]
         encoder_att = torch.ones(encoder_output.size()[:-1], dtype=torch.long).to(device)
         output = model.text_encoder.bert(encoder_embeds=text_feats[start + i].repeat(config['k_test'], 1, 1),
@@ -330,7 +331,9 @@ if __name__ == '__main__':
     parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
     parser.add_argument('--distributed', default=True, type=bool)
+    # parser.add_argument('--distributed', default=True, type=bool)
     args = parser.parse_args()
+    args.evaluate=True
     config = yaml.load(open(args.config, 'r'), Loader=yaml.Loader)
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     yaml.dump(config, open(os.path.join(args.output_dir, 'config.yaml'), 'w'))
