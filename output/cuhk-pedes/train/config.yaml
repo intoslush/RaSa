@@ -3,7 +3,7 @@ batch_size_test: 64
 batch_size_train: 13
 bert_config: configs/config_bert.json
 embed_dim: 256
-eval_epoch: 29
+eval_epoch: 24
 image_res: 384
 k_test: 128
 max_words: 50

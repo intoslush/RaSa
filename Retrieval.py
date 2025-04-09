@@ -19,7 +19,9 @@ from my_models.tokenization_bert import BertTokenizer
 from my_models.vit import interpolate_pos_embed
 from optim import create_optimizer
 from scheduler import create_scheduler
-
+import random
+import math
+from torch.utils.data import DistributedSampler
 
 os.environ['http_proxy'] = "http://127.0.0.1:7890"
 os.environ['https_proxy'] = "http://127.0.0.1:7890"
@@ -31,7 +33,7 @@ from sklearn.cluster import DBSCAN
 from my_utils.faiss_rerank import compute_jaccard_distance
 def cluster_begin_epoch(train_loader, model, args,epoch = 0,tokenizer = None):
     device = "cuda"
-    feature_size =256 #cuhk是577
+    feature_size =256 #cuhk是577,融合之后是768
     max_size = args.batch_size* ( len(train_loader)  )  #这个是所有的图片和描述对的数量共计6800对左右     
     image_bank = torch.zeros((max_size, feature_size)).to(device)
     index = 0
@@ -44,23 +46,32 @@ def cluster_begin_epoch(train_loader, model, args,epoch = 0,tokenizer = None):
             model=model.module
         metric_logger = utils.MetricLogger(delimiter="  ")
         header = 'Train Epoch的聚类: [{}]'.format(epoch)
-        for i, (image1, image2, text1, text2, idx, replace) in enumerate(metric_logger.log_every(train_loader, 60000, header)):
+        for i, (image1, image2, text1, text2, idx, replace,real_idx) in enumerate(metric_logger.log_every(train_loader, 60000, header)):
             image1 = image1.to(device, non_blocking=True)
-            image2 = image2.to(device, non_blocking=True)
-            idx = idx.to(device, non_blocking=True)
+            # image2 = image2.to(device, non_blocking=True)
+            # idx = idx.to(device, non_blocking=True)
             replace = replace.to(device, non_blocking=True)
-            text_input1 = tokenizer(text1, padding='longest', max_length=config['max_words'], return_tensors="pt").to(device)
-            text_input2 = tokenizer(text2, padding='longest', max_length=config['max_words'], return_tensors="pt").to(device)
+            # text_input1 = tokenizer(text1, padding='longest', max_length=config['max_words'], return_tensors="pt").to(device)
+            # text_input2 = tokenizer(text2, padding='longest', max_length=config['max_words'], return_tensors="pt").to(device)
             
             image_embeds = model.visual_encoder(image1)#(13,577,768)
-            image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image1.device)#注意力掩码全一表示所有图像token都应该被关注
+            # image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image1.device)#注意力掩码全一表示所有图像token都应该被关注
             image_feat = F.normalize(model.vision_proj(image_embeds[:, 0, :]), dim=-1)#用于取cls token的特征,shape(13,577)
             # extract text features
-            text_output = model.text_encoder.bert(text_input2.input_ids, attention_mask=text_input2.attention_mask,
-                                                return_dict=True, mode='text')
-            text_embeds = text_output.last_hidden_state
-            text_feat = F.normalize(model.text_proj(text_embeds[:, 0, :]), dim=-1)#同样是取cls token的特征
+            # text_output = model.text_encoder.bert(text_input2.input_ids, attention_mask=text_input2.attention_mask,
+                                                # return_dict=True, mode='text')
+            # text_embeds = text_output.last_hidden_state
+            # text_feat = F.normalize(model.text_proj(text_embeds[:, 0, :]), dim=-1)#同样是取cls token的特征
             batch_size = image1.shape[0]
+            
+            # output_pos =model.text_encoder.bert(encoder_embeds=text_embeds,
+            #                                 attention_mask=text_input2.attention_mask,
+            #                                 encoder_hidden_states=image_embeds,
+            #                                 encoder_attention_mask=image_atts,
+            #                                 return_dict=True,
+            #                                 mode='fusion',
+            #                                 )
+            # fusion_feat=output_pos.last_hidden_state[:, 0, :]#shape(13,768)
             image_bank[index: index + batch_size] = image_feat
             index = index + batch_size
             
@@ -75,32 +86,71 @@ def cluster_begin_epoch(train_loader, model, args,epoch = 0,tokenizer = None):
 
         del image_rerank_dist
     del image_bank
-
-    # with torch.no_grad():
-    #     for n_iter, batch in enumerate(train_loader):       
-    #         batch = {k: v.to(device) for k, v in batch.items()}
-    #         batch_size = batch['images'].shape[0]   
-    #         i_feats = model(batch, flag=False)
-
-    #         image_bank[index: index + batch_size] = i_feats
-
-    #         index = index + batch_size
-
-    #     image_bank = image_bank[:index]       
-    #     image_rerank_dist = compute_jaccard_distance(image_bank, k1=30, k2=6, search_option=0)  
-
-    #     # DBSCAN cluster
-    #     cluster = DBSCAN(eps= 0.6, min_samples=4, metric='precomputed', n_jobs=-1)
-
-    #     image_pseudo_labels = cluster.fit_predict(image_rerank_dist)    
-
-    #     del image_rerank_dist
-    # del image_bank
-
     return image_pseudo_labels
 
 
 
+class ValidIndexDistributedSampler(DistributedSampler):
+    def __init__(self, dataset, num_replicas=None, rank=None, shuffle=True, seed=0, drop_last=True):
+        super().__init__(dataset, num_replicas, rank, shuffle, seed, drop_last)
+        self.epoch = 0
+        self.valid_indices = self._sync_valid_indices()
+
+    def _sync_valid_indices(self):
+        """
+        获取并同步 valid_indices，避免多进程不一致。
+        """
+        # 主进程获取
+        if dist.get_rank() == 0:
+            if hasattr(self.dataset, 'valid_indices'):
+                valid_indices = self.dataset.valid_indices
+            else:
+                valid_indices = list(range(len(self.dataset)))
+        else:
+            valid_indices = None
+
+        # 广播同步
+        object_list = [valid_indices]
+        dist.broadcast_object_list(object_list, src=0)
+        return object_list[0]
+
+    def __iter__(self):
+        indices = self.valid_indices
+
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            indices = torch.randperm(len(indices), generator=g).tolist()
+
+        # 统一长度逻辑
+        if self.drop_last:
+            num_samples_per_replica = len(indices) // self.num_replicas
+            total_size = num_samples_per_replica * self.num_replicas
+            indices = indices[:total_size]
+        else:
+            num_samples_per_replica = int(math.ceil(len(indices) / self.num_replicas))
+            total_size = num_samples_per_replica * self.num_replicas
+            padding_size = total_size - len(indices)
+            if padding_size > 0:
+                # 重复填充（防止部分 rank 拿不到数据）
+                indices += indices[:padding_size]
+
+        assert len(indices) == total_size
+
+        # 分配给当前 rank
+        indices = indices[self.rank:total_size:self.num_replicas]
+        assert len(indices) == num_samples_per_replica
+
+        return iter(indices)
+
+    def __len__(self):
+        if self.drop_last:
+            return len(self.valid_indices) // self.num_replicas
+        else:
+            return int(math.ceil(len(self.valid_indices) / self.num_replicas))
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
 
 def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, scheduler, config,image_pseudo_labels):
     # train
@@ -116,29 +166,65 @@ def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device,
     print_freq = 50
     step_size = 100
     warmup_iterations = warmup_steps * step_size
-    for i, (image1, image2, text1, text2, idx, replace) in enumerate(
+    for i, (image1, image2, text1, text2, idx, replace,real_idx) in enumerate(
             metric_logger.log_every(data_loader, print_freq, header)):
         batch_size = image1.shape[0]
         #单次的伪标签
-        batch_pseudo_id = image_pseudo_labels[i*batch_size : i*batch_size + batch_size]
+        batch_pseudo_id = image_pseudo_labels[real_idx]
         
         image1 = image1.to(device, non_blocking=True)
         image2 = image2.to(device, non_blocking=True)
-        # idx = idx.to(device, non_blocking=True)
-        idx= torch.tensor(batch_pseudo_id).to(device, non_blocking=True)
-        
         replace = replace.to(device, non_blocking=True)
-        text_input1 = tokenizer(text1, padding='longest', max_length=config['max_words'], return_tensors="pt").to(device)
-        text_input2 = tokenizer(text2, padding='longest', max_length=config['max_words'], return_tensors="pt").to(device)
-        if epoch > 0 or not config['warm_up']:
-            alpha = config['alpha']
+        # idx = idx.to(device, non_blocking=True)
+
+        # print(idx)
+
+        # 转换为 Tensor
+        idx = torch.tensor(batch_pseudo_id).to(device, non_blocking=True)
+        valid_mask = idx != -1
+        valid_mask = valid_mask.to(device, non_blocking=True)
+        # 计算有效样本数量
+        valid_count = valid_mask.sum().item()
+    
+        # 初始化损失为0
+        loss_cl = loss_pitm = loss_mlm = loss_prd = loss_mrtd = torch.tensor(0.0, device=device)
+        
+        if valid_count > 0:
+            # 有有效样本时正常处理
+            # 🧹 Step 2: 根据掩码筛选数据
+            valid_image1 = image1[valid_mask]
+            valid_image2 = image2[valid_mask]
+            valid_replace = replace[valid_mask]
+            valid_idx = idx[valid_mask]
+            
+            # 注意：text 需要是 list[str]，不是 Tensor，因此也按 mask 筛选
+            valid_text1 = [t for j, t in enumerate(text1) if valid_mask[j]]
+            valid_text2 = [t for j, t in enumerate(text2) if valid_mask[j]]
+            
+            valid_text_input1 = tokenizer(valid_text1, padding='longest', max_length=config['max_words'], return_tensors="pt").to(device)
+            valid_text_input2 = tokenizer(valid_text2, padding='longest', max_length=config['max_words'], return_tensors="pt").to(device)
+            
+            if epoch > 0 or not config['warm_up']:
+                alpha = config['alpha']
+            else:
+                alpha = config['alpha'] * min(1.0, i / len(data_loader))
+                
+            loss_cl, loss_pitm, loss_mlm, loss_prd, loss_mrtd = model(valid_image1, valid_image2, 
+                                                                valid_text_input1, valid_text_input2,
+                                                                alpha=alpha, idx=valid_idx, replace=valid_replace)
         else:
-            alpha = config['alpha'] * min(1.0, i / len(data_loader))
-        loss_cl, loss_pitm, loss_mlm, loss_prd, loss_mrtd = model(image1, image2, text_input1, text_input2,
-                                                                  alpha=alpha, idx=idx, replace=replace)
+            # 如果没有有效样本，创建一个很小的损失以保持梯度流动
+            # 这个损失足够小，不会影响训练，但能让NCCL同步工作
+            dummy_loss = torch.tensor(1e-8, device=device, requires_grad=True)
+            loss_cl = loss_pitm = loss_mlm = loss_prd = loss_mrtd = dummy_loss
+        
+        
+        # 计算总损失
         loss = 0.
         for j, los in enumerate((loss_cl, loss_pitm, loss_mlm, loss_prd, loss_mrtd)):
             loss += config['weights'][j] * los
+
+        
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -205,6 +291,7 @@ def evaluation(model, data_loader, tokenizer, device, config):
     end = min(sims_matrix.size(0), start + step)
     for i, sims in enumerate(metric_logger.log_every(sims_matrix[start:end], 50, header)):
         topk_sim, topk_idx = sims.topk(k=config['k_test'], dim=0)
+        topk_idx = topk_idx.to(image_feats.device)
         encoder_output = image_feats[topk_idx]
         encoder_att = torch.ones(encoder_output.size()[:-1], dtype=torch.long).to(device)
         output = model.text_encoder.bert(encoder_embeds=text_feats[start + i].repeat(config['k_test'], 1, 1),
@@ -281,12 +368,19 @@ def main(args, config):
     # Dataset
     print("Creating retrieval dataset")
     train_dataset, val_dataset, test_dataset = create_dataset('ps', config)
+    # if args.distributed:
+    #     num_tasks = utils.get_world_size()
+    #     global_rank = utils.get_rank()
+    #     samplers = create_sampler([train_dataset], [True], num_tasks, global_rank) + [None, None]
+    # else:
+    #     samplers = [None, None, None]
+        
     if args.distributed:
-        num_tasks = utils.get_world_size()
-        global_rank = utils.get_rank()
-        samplers = create_sampler([train_dataset], [True], num_tasks, global_rank) + [None, None]
+        sampler = ValidIndexDistributedSampler(train_dataset, num_replicas=utils.get_world_size(), rank=utils.get_rank())
     else:
-        samplers = [None, None, None]
+        sampler = None
+
+    samplers = [sampler, None, None]
     #dataloader在这,然后logevery是直接迭代这个
     train_loader, val_loader, test_loader = create_loader([train_dataset, val_dataset, test_dataset], samplers,
                                                           batch_size=[config['batch_size_train']] + [
@@ -294,12 +388,18 @@ def main(args, config):
                                                           num_workers=[4, 4, 4],
                                                           is_trains=[True, False, False],
                                                           collate_fns=[None, None, None])
+    cluster_lodaer = create_loader([train_dataset], [None],
+                                                          batch_size=[config['batch_size_train']],
+                                                          num_workers=[4],
+                                                          is_trains=[False],
+                                                          collate_fns=[None])[0]
+    
     print("args.text_encoder",args.text_encoder)
     tokenizer = BertTokenizer.from_pretrained(args.text_encoder, 
-                                        # proxies={'http': 'http://127.0.0.1:7890',
-                                        #         'https': 'http://127.0.0.1:7890'},
+                                        proxies={'http': 'http://127.0.0.1:7890',
+                                                'https': 'http://127.0.0.1:7890'},
                                         trust_remote_code=True, 
-                                                # force_download=True,
+                                                force_download=True,
                                                 local_files_only=True,
                                                 )#
 
@@ -350,10 +450,25 @@ def main(args, config):
     for epoch in range(start_epoch, max_epoch):
         
         if not args.evaluate:
-             #TODO,这里使用聚类生成伪标签
-            image_pseudo_labels = cluster_begin_epoch(train_loader, model, args,epoch,tokenizer)
+            train_dataset.mode = 'cluster'
+            if args.distributed:
+                # 伪标签一个rank生成然后广播
+                if torch.distributed.get_rank() == 0:
+                    image_pseudo_labels_np = cluster_begin_epoch(cluster_lodaer, model, args, epoch, tokenizer)
+                    image_pseudo_labels = torch.tensor(image_pseudo_labels_np).long().cuda()
+                else:
+                    image_pseudo_labels = torch.empty(len(train_dataset), dtype=torch.long).cuda()
+
+                # 全局同步
+                torch.distributed.broadcast(image_pseudo_labels, src=0)
+            else:
+                image_pseudo_labels = cluster_begin_epoch(cluster_lodaer, model, args,epoch,tokenizer)
             image_num_cluster = len(set(image_pseudo_labels)) - (1 if -1 in image_pseudo_labels else 0)
             print("==> Statistics for epoch [{}]: {} image clusters".format(epoch, image_num_cluster))
+            
+            train_dataset.set_pseudo_labels(image_pseudo_labels)
+            train_dataset.mode = 'train'
+            
             if epoch > 0:
                 lr_scheduler.step(epoch + warmup_steps)
             if args.distributed:
