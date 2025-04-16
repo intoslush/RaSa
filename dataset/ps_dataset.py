@@ -40,7 +40,8 @@ class ps_train_dataset(Dataset):
         self.mode = "train"
         
     def set_pseudo_labels(self, labels):
-        # assert len(labels) == len(self.pairs), "标签数量和样本数量不一致"
+        assert len(labels) == len(self.pairs), "标签数量和样本数量不一致"
+        print("成功将伪标签写入数据集中")
         self.pseudo_labels = labels
         self.valid_indices = [i for i, label in enumerate(labels) if label != -1]
 
@@ -65,9 +66,12 @@ class ps_train_dataset(Dataset):
         person	数据集中原始ID编号,如：第一个人是 0，第二个是 1
         pseudo_labels[real_idx]	动态生成的 int 或 -1,如：DBSCAN 聚类后为：13、17、22
         real_idx	Dataset 的真实下标,如：第 127 个样本，real_idx = 127
-        """
+        """ 
+        
         if self.mode == 'train' and self.pseudo_labels is not None:
             real_idx = self.valid_indices[index]
+            if index >= len(self.valid_indices):
+                raise IndexError(f"Index {index} out of range: valid_indices has length {len(self.valid_indices)}")
         else:
             real_idx = index
         image_path, caption, person = self.pairs[real_idx]

@@ -23,6 +23,8 @@ import random
 import math
 from torch.utils.data import DistributedSampler
 
+import pickle
+
 os.environ['http_proxy'] = "http://127.0.0.1:7890"
 os.environ['https_proxy'] = "http://127.0.0.1:7890"
 # 设置 transformers 缓存目录
@@ -34,7 +36,7 @@ from my_utils.faiss_rerank import compute_jaccard_distance
 def cluster_begin_epoch(train_loader, model, args,epoch = 0,tokenizer = None):
     device = "cuda"
     feature_size =256 #cuhk是577,融合之后是768
-    max_size = args.batch_size* ( len(train_loader)  )  #这个是所有的图片和描述对的数量共计6800对左右     
+    max_size = len(train_loader.dataset)  #这个是所有的图片和描述对的数量共计6800对左右     
     image_bank = torch.zeros((max_size, feature_size)).to(device)
     index = 0
 
@@ -76,19 +78,51 @@ def cluster_begin_epoch(train_loader, model, args,epoch = 0,tokenizer = None):
             index = index + batch_size
             
 
-        image_bank = image_bank[:index]       
-        image_rerank_dist = compute_jaccard_distance(image_bank, k1=30, k2=6, search_option=0)  
+        image_bank = image_bank[:index]  
+        print(f"Rank {torch.distributed.get_rank()} | 开始计算不同类之间的距离",index)    
+        try:
+            image_rerank_dist = compute_jaccard_distance(image_bank, k1=30, k2=6, search_option=0)  
+        except Exception as e:
+            print(f"[Rank {torch.distributed.get_rank()}] 计算距离出错：{e}")     
+        # image_rerank_dist = compute_jaccard_distance(image_bank, k1=30, k2=6, search_option=0)  
 
         # DBSCAN cluster
+        print(f"\n[Rank {torch.distributed.get_rank()} | 聚类开始]")
         cluster = DBSCAN(eps= 0.6, min_samples=4, metric='precomputed', n_jobs=-1)
 
         image_pseudo_labels = cluster.fit_predict(image_rerank_dist)    
 
         del image_rerank_dist
+        # ✅ 打印统计信息
+        dataset_len = len(train_loader.dataset)
+        num_noise = (image_pseudo_labels == -1).sum()
+        num_clusters = len(set(image_pseudo_labels)) - (1 if -1 in image_pseudo_labels else 0)
+
+        print(f"\n[Rank {torch.distributed.get_rank()} | 聚类完成]")
+        print(f"Dataset 总长度: {dataset_len}")
+        print(f"聚类数（不含 -1）: {num_clusters}")
+        print(f"-1 (未归入任何簇) 的数量: {num_noise}\n")
     del image_bank
+    # save_path= os.path.join(args.output_dir, f'cluster.pkl')
+    # if save_path is not None:
+    #     os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    #     with open(save_path, 'wb') as f:
+    #         pickle.dump({
+    #             'pseudo_labels': image_pseudo_labels,
+    #         }, f)
+    #     print(f"Pseudo labels (pickle) saved to {save_path}")
     return image_pseudo_labels
 
 
+
+def load_pseudo_labels_from_pickle(file_path):
+    if os.path.exists(file_path):
+        with open(file_path, 'rb') as f:
+            data = pickle.load(f)
+        print(f"Loaded pseudo labels from {file_path}")
+        return data['pseudo_labels']
+    else:
+        raise FileNotFoundError(f"No pseudo label pickle found at {file_path}")
 
 class ValidIndexDistributedSampler(DistributedSampler):
     def __init__(self, dataset, num_replicas=None, rank=None, shuffle=True, seed=0, drop_last=True):
@@ -113,8 +147,12 @@ class ValidIndexDistributedSampler(DistributedSampler):
         object_list = [valid_indices]
         dist.broadcast_object_list(object_list, src=0)
         return object_list[0]
-
+    def set_valid_indices(self, valid_indices):
+        self.valid_indices = valid_indices
+        
+        
     def __iter__(self):
+
         indices = self.valid_indices
 
         if self.shuffle:
@@ -175,8 +213,6 @@ def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device,
         image1 = image1.to(device, non_blocking=True)
         image2 = image2.to(device, non_blocking=True)
         replace = replace.to(device, non_blocking=True)
-        # idx = idx.to(device, non_blocking=True)
-
         # print(idx)
 
         # 转换为 Tensor
@@ -209,9 +245,20 @@ def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device,
             else:
                 alpha = config['alpha'] * min(1.0, i / len(data_loader))
                 
-            loss_cl, loss_pitm, loss_mlm, loss_prd, loss_mrtd = model(valid_image1, valid_image2, 
-                                                                valid_text_input1, valid_text_input2,
-                                                                alpha=alpha, idx=valid_idx, replace=valid_replace)
+            try:
+                loss_cl, loss_pitm, loss_mlm, loss_prd, loss_mrtd = model(valid_image1, valid_image2, 
+                                                                    valid_text_input1, valid_text_input2,
+                                                                    alpha=alpha, idx=valid_idx, replace=valid_replace)
+            except Exception as e:
+                print("🚨 Model forward error:", str(e))
+                print("valid_image1.shape:", valid_image1.shape)
+                print("valid_image2.shape:", valid_image2.shape)
+                print("valid_text_input1.input_ids.shape:", valid_text_input1['input_ids'].shape)
+                print("valid_text_input2.input_ids.shape:", valid_text_input2['input_ids'].shape)
+                print("valid_idx.shape:", valid_idx.shape)
+                print("valid_replace.shape:", valid_replace.shape)
+                raise  # re-raise the exception to not hide the original error
+                            
         else:
             # 如果没有有效样本，创建一个很小的损失以保持梯度流动
             # 这个损失足够小，不会影响训练，但能让NCCL同步工作
@@ -223,8 +270,6 @@ def train(model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device,
         loss = 0.
         for j, los in enumerate((loss_cl, loss_pitm, loss_mlm, loss_prd, loss_mrtd)):
             loss += config['weights'][j] * los
-
-        
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -357,6 +402,7 @@ def main(args, config):
     device = torch.device(args.device)
     print(args)
     print(config)
+    print("args.distributed",args.distributed)
     # fix the seed for reproducibility
     seed = args.seed + utils.get_rank()
     torch.manual_seed(seed)
@@ -451,30 +497,49 @@ def main(args, config):
         
         if not args.evaluate:
             train_dataset.mode = 'cluster'
+            
             if args.distributed:
                 # 伪标签一个rank生成然后广播
-                if torch.distributed.get_rank() == 0:
-                    image_pseudo_labels_np = cluster_begin_epoch(cluster_lodaer, model, args, epoch, tokenizer)
-                    image_pseudo_labels = torch.tensor(image_pseudo_labels_np).long().cuda()
-                else:
-                    image_pseudo_labels = torch.empty(len(train_dataset), dtype=torch.long).cuda()
+                # pseudo_label_path = os.path.join(args.output_dir, f'cluster.pkl')
+                # if os.path.exists(pseudo_label_path):
+                #     image_pseudo_labels_np = load_pseudo_labels_from_pickle(pseudo_label_path)
+                #     image_pseudo_labels = torch.tensor(image_pseudo_labels_np).long().cuda()
+                # else:
+                #     if torch.distributed.get_rank() == 0:
+                #         image_pseudo_labels_np = cluster_begin_epoch(cluster_lodaer, model, args, epoch, tokenizer)
+                #         image_pseudo_labels = torch.tensor(image_pseudo_labels_np).long().cuda()
+                #     else:
+                #         image_pseudo_labels_np = cluster_begin_epoch(cluster_lodaer, model, args, epoch, tokenizer)
 
                 # 全局同步
+                image_pseudo_labels_np = cluster_begin_epoch(cluster_lodaer, model, args, epoch, tokenizer)
+                image_pseudo_labels = torch.tensor(image_pseudo_labels_np).long().cuda()
                 torch.distributed.broadcast(image_pseudo_labels, src=0)
+                
             else:
-                image_pseudo_labels = cluster_begin_epoch(cluster_lodaer, model, args,epoch,tokenizer)
+                image_pseudo_labels_np = cluster_begin_epoch(cluster_lodaer, model, args,epoch,tokenizer)
+                # image_pseudo_labels_np = load_pseudo_labels_from_pickle(pseudo_label_path)
+                image_pseudo_labels = torch.tensor(image_pseudo_labels_np).long().cuda()
+            image_pseudo_labels=image_pseudo_labels.tolist()
             image_num_cluster = len(set(image_pseudo_labels)) - (1 if -1 in image_pseudo_labels else 0)
-            print("==> Statistics for epoch [{}]: {} image clusters".format(epoch, image_num_cluster))
+            # print("==> Statistics for epoch [{}]: {} image clusters".format(epoch, image_num_cluster))
             
-            train_dataset.set_pseudo_labels(image_pseudo_labels)
+            
+            # print(f"Rank {torch.distributed.get_rank()} | 伪标签数量: {len(image_pseudo_labels)}")
+            # print(f"Rank {torch.distributed.get_rank()} | 样本数: {train_dataset.__len__()}")
+            
             train_dataset.mode = 'train'
+            train_dataset.set_pseudo_labels(image_pseudo_labels)
+            # print(f"Rank {torch.distributed.get_rank()} | 写入伪标签后的样本数: {train_dataset.__len__()}")
             
             if epoch > 0:
                 lr_scheduler.step(epoch + warmup_steps)
             if args.distributed:
+                train_loader.sampler.set_valid_indices(train_dataset.valid_indices)
                 train_loader.sampler.set_epoch(epoch)
+                
             train_stats = train(model, train_loader, optimizer, tokenizer, epoch, warmup_steps, device, lr_scheduler,
-                                config,image_pseudo_labels)
+                                config,torch.tensor(image_pseudo_labels).to(device))
         
         
         if epoch >= config['eval_epoch'] or args.evaluate:

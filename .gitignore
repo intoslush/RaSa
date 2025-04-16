@@ -146,3 +146,4 @@ re_id
 re_id/
 /re_id
 /re_id/**
+*.pth

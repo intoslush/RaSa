@@ -117,10 +117,16 @@ class ALBEF(nn.Module):
             bs = image1.size(0)
             weights_i2t = F.softmax(sim_i2t[:, :bs], dim=1)
             weights_t2i = F.softmax(sim_t2i[:, :bs], dim=1)
+            
             mask = torch.eq(idx, idx.T)
+            if idx.shape[0] <= 2:
+                raise ValueError("Batch size too small, idx.shape[0] = {}".format(idx.shape[0]))
             weights_i2t.masked_fill_(mask, 0)#通过掩码保证不会选正样本作为难样本
             weights_t2i.masked_fill_(mask, 0)
+            # weights_t2i = weights_t2i + 1e-8
+            # weights_i2t = weights_i2t + 1e-8
         # select a negative image for each text
+        
         image_neg_idx = torch.multinomial(weights_t2i, 1).flatten()
         image_embeds_neg = image_embeds[image_neg_idx]#难的负样本
         # select a negative text for each image
