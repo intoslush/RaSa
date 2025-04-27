@@ -24,15 +24,16 @@ import math
 from torch.utils.data import DistributedSampler
 
 import pickle
-
-os.environ['http_proxy'] = "http://127.0.0.1:7890"
-os.environ['https_proxy'] = "http://127.0.0.1:7890"
+# from transformers import BertTokenizer
+# from huggingface_hub import snapshot_download
 # 设置 transformers 缓存目录
 # os.environ['TRANSFORMERS_CACHE'] = '/home/root/.cache/huggingface/transformers'
 
 # cluster images before each epoch begins
 from sklearn.cluster import DBSCAN
 from my_utils.faiss_rerank import compute_jaccard_distance
+
+os.environ["TRANSFORMERS_CACHE"] = "/dssg/work3/xlyang/xlyang/wcj/cxd/.cache/"
 def cluster_begin_epoch(train_loader, model, args,epoch = 0,tokenizer = None):
     device = "cuda"
     feature_size =256 #cuhk是577,融合之后是768
@@ -81,7 +82,8 @@ def cluster_begin_epoch(train_loader, model, args,epoch = 0,tokenizer = None):
         image_bank = image_bank[:index]  
         print(f"Rank {torch.distributed.get_rank()} | 开始计算不同类之间的距离",index)    
         try:
-            image_rerank_dist = compute_jaccard_distance(image_bank, k1=30, k2=6, search_option=0)  
+            
+            image_rerank_dist = compute_jaccard_distance(image_bank, k1=30, k2=6, search_option=3)  
         except Exception as e:
             print(f"[Rank {torch.distributed.get_rank()}] 计算距离出错：{e}")     
         # image_rerank_dist = compute_jaccard_distance(image_bank, k1=30, k2=6, search_option=0)  
@@ -441,14 +443,25 @@ def main(args, config):
                                                           collate_fns=[None])[0]
     
     print("args.text_encoder",args.text_encoder)
-    tokenizer = BertTokenizer.from_pretrained(args.text_encoder, 
-                                        proxies={'http': 'http://127.0.0.1:7890',
-                                                'https': 'http://127.0.0.1:7890'},
-                                        trust_remote_code=True, 
-                                                force_download=True,
-                                                local_files_only=True,
-                                                )#
+    # tokenizer = BertTokenizer.from_pretrained(args.text_encoder, 
+    #                                     proxies={'http': 'http://127.0.0.1:7890',
+    #                                             'https': 'http://127.0.0.1:7890'},
+    #                                     trust_remote_code=True, 
+    #                                             force_download=True,
+    #                                             local_files_only=True,
+    #                                             )#
 
+    # tokenizer = BertTokenizer.from_pretrained(
+    # "/dssg/work3/xlyang/xlyang/wcj/cxd/.cache/bert-base-uncased/bert-base-uncased",  # 使用绝对路径
+    # local_files_only=True,                # 强制仅使用本地文件
+    # force_download=False,                 # 必须关闭强制下载
+    # proxies=None                          # 明确禁用代理
+    # )
+    # tokenizer = BertTokenizer.from_pretrained("/dssg/work3/xlyang/xlyang/wcj/cxd/.cache/")
+    "/dssg/work3/xlyang/xlyang/wcj/cxd/.cache/bert-local"
+    # model_path = snapshot_download("bert-base-uncased", cache_dir="/dssg/work3/xlyang/xlyang/wcj/cxd/.cache/bert-base-uncased")
+    tokenizer = BertTokenizer.from_pretrained("/dssg/work3/xlyang/xlyang/wcj/cxd/.cache/bert-local", local_files_only=True)
+    
     start_epoch = 0
     max_epoch = config['schedular']['epochs']
     warmup_steps = config['schedular']['warmup_epochs']
